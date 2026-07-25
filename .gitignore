@@ -1,0 +1,8 @@
+build/
+*.o
+*.exe
+*.obj
+.DS_Store
+.vscode/
+.idea/
+*.log
