@@ -38,6 +38,10 @@
 #define DEFAULT_WORDS "checkpoints/tinystories.words"
 #define DEFAULT_META "checkpoints/tinystories.meta"
 #define VOCAB_CAP FLUENCY_VOCAB
+/* Periodic partial checkpoint so a cancelled run keeps its progress. */
+#ifndef SAVE_EVERY_TOKS
+#define SAVE_EVERY_TOKS 25000000ull
+#endif
 /* Open-addressing: load ~0.5 → 400k uniques need ~1M slots. */
 #define FREQ_SLOTS (1u << 20)
 #define ID_SLOTS (1u << 15) /* 32k slots, vocab ≤ 16k */
@@ -254,6 +258,8 @@ int main(int argc, char **argv) {
     flu_tok_t *chunk = NULL;
     size_t cn = 0;
     uint64_t trained = 0, oov = 0;
+    uint64_t last_ckpt = 0;
+    char part_path[1024];
     long corpus_bytes = 0;
     BufIn bin;
 
@@ -277,6 +283,7 @@ int main(int argc, char **argv) {
     }
 
     setvbuf(stdout, NULL, _IONBF, 0);
+    snprintf(part_path, sizeof(part_path), "%s.partial", ckpt);
     printf("=== TinyStories FULL pretrain ===\n");
     printf("corpus=%s\n", corpus);
     printf("ckpt=%s\nwords=%s\n", ckpt, words_path);
@@ -352,6 +359,9 @@ int main(int argc, char **argv) {
     free(tab);
     tab = NULL;
     printf("vocab sealed count=%u (incl <unk>)\n", W->count);
+    /* Words written now so a partial checkpoint is loadable mid-run. */
+    if (nerva_words_save(W, words_path) != 0)
+        fprintf(stderr, "WARN early words save failed %s\n", words_path);
 
     idmap = (IdSlot *)calloc(ID_SLOTS, sizeof(IdSlot));
     if (!idmap) {
@@ -441,6 +451,15 @@ int main(int argc, char **argv) {
                        (unsigned long long)trained, eng.node_count, eng.edge_count,
                        (double)process_rss() / (1024.0 * 1024.0), wall_sec() - t0);
             }
+            if (trained - last_ckpt >= SAVE_EVERY_TOKS) {
+                double ts = wall_sec();
+                if (fluency_save(&model, part_path) == 0)
+                    printf("  partial ckpt trained_toks=%llu path=%s save_s=%.1f\n",
+                           (unsigned long long)trained, part_path, wall_sec() - ts);
+                else
+                    fprintf(stderr, "WARN partial ckpt save failed %s\n", part_path);
+                last_ckpt = trained;
+            }
         }
     }
     if (cn > 0) {
@@ -467,7 +486,9 @@ int main(int argc, char **argv) {
     }
 
     printf("saving checkpoint...\n");
-    if (fluency_save(&model, ckpt) != 0) {
+    if (fluency_save(&model, ckpt) == 0) {
+        remove(part_path);
+    } else {
         fprintf(stderr, "FAIL fluency_save %s\n", ckpt);
         fluency_free(&model);
         nerva_engine_free(&eng);
