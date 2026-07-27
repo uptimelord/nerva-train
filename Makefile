@@ -1,4 +1,4 @@
-# nerva-train — single product binary
+# nerva-train — product binary + TinyStories pretrain
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Iinclude -Iworlds/fluency
 LDFLAGS ?=
@@ -6,8 +6,10 @@ LDLIBS ?= -lm
 ifeq ($(OS),Windows_NT)
   LDLIBS += -lpsapi
   BIN = build/nerva.exe
+  PRETRAIN = build/pretrain.exe
 else
   BIN = build/nerva
+  PRETRAIN = build/pretrain
 endif
 
 LIB_SRCS = \
@@ -30,23 +32,36 @@ LIB_SRCS = \
 	src/nerva_work.c
 
 LIB_OBJS = $(patsubst src/%.c,build/%.o,$(LIB_SRCS))
-FLU_OBJ = build/fluency.o
+FLU_OBJS = build/fluency.o build/fluency_session.o
 
-.PHONY: all product selfcheck clean
+.PHONY: all product pretrain selfcheck clean checkpoints
 
-all product: $(BIN)
+all product: $(BIN) $(PRETRAIN)
 
 build:
 	mkdir -p build
 
+checkpoints:
+	mkdir -p checkpoints
+
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(FLU_OBJ): worlds/fluency/fluency.c | build
+build/fluency.o: worlds/fluency/fluency.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BIN): tools/nerva.c $(LIB_OBJS) $(FLU_OBJ) | build
-	$(CC) $(CFLAGS) tools/nerva.c $(LIB_OBJS) $(FLU_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+build/fluency_session.o: worlds/fluency/fluency_session.c | build
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BIN): tools/nerva.c $(LIB_OBJS) $(FLU_OBJS) | build
+	$(CC) $(CFLAGS) tools/nerva.c $(LIB_OBJS) $(FLU_OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(PRETRAIN): tools/pretrain.c $(LIB_OBJS) $(FLU_OBJS) | build checkpoints
+	$(CC) $(CFLAGS) tools/pretrain.c $(LIB_OBJS) $(FLU_OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
+
+# Full TinyStories stream → checkpoints/tinystories.sess (long run)
+pretrain: $(PRETRAIN)
+	./$(PRETRAIN)
 
 selfcheck: $(BIN)
 	./$(BIN) --selfcheck

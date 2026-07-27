@@ -10,28 +10,44 @@ This is the clean extract from the Nerva lab monorepo (probes, ERG ladder, and e
 
 ## Build
 
-**Linux / MinGW:**
 ```bash
-make
-./build/nerva
+make                 # build/nerva + build/pretrain
 ```
 
-**Windows (PowerShell, with gcc on PATH or use lab’s toolchain path):**
-```powershell
-# from this repo root
-make
-.\build\nerva.exe
+## TinyStories pretrain (once) → frozen checkpoint
+
+Put full train file at `data/tinystories/TinyStories-train.txt` (or pass `--corpus`).
+
+```bash
+make pretrain
+# writes:
+#   checkpoints/tinystories.sess   model weights
+#   checkpoints/tinystories.words  word lexicon
+#   checkpoints/tinystories.meta   stats
+```
+
+Chat CLI **loads the checkpoint by default** and does **not** retrain:
+
+```bash
+./build/nerva                 # boot_mode=LOAD_CHECKPOINT
+./build/nerva --selfcheck
+```
+
+Force tiny smoke train only (dev, not TinyStories):
+
+```bash
+./build/nerva --force-smoke-train
 ```
 
 ## Use
 
 ```text
-./build/nerva --selfcheck          # automated PASS/FAIL
-./build/nerva                      # interactive
+./build/nerva --selfcheck
+./build/nerva
 
-you> /seq alice likes green tea    # PCW-teach multi-word sequence
-you> /gen alice 3                  # LM generate
-you> hello there                   # free text → same generate path
+you> /seq alice likes green tea
+you> /gen alice 3
+you> hello there
 you> /quit
 ```
 

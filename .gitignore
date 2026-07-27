@@ -1,4 +1,9 @@
 build/
+checkpoints/*.sess
+checkpoints/*.words
+checkpoints/*.meta
+!checkpoints/.gitkeep
+data/tinystories/
 *.o
 *.exe
 *.obj

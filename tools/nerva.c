@@ -10,8 +10,10 @@
  */
 
 #include "fluency.h"
+#include "fluency_session.h"
 #include "nerva_config.h"
 #include "nerva_engine.h"
+#include "nerva_words_io.h"
 #include "nerva_work.h"
 
 #include <stdio.h>
@@ -21,7 +23,9 @@
 #define MAX_TOK 256
 #define GEN_MAX 16
 #define HIST_MAX 128
-#define CORPUS_PATH "worlds/fluency/corpus/train.txt"
+#define SMOKE_CORPUS "worlds/fluency/corpus/train.txt"
+#define DEFAULT_CKPT "checkpoints/tinystories.sess"
+#define DEFAULT_WORDS "checkpoints/tinystories.words"
 
 typedef struct {
     NervaEngine eng;
@@ -33,29 +37,63 @@ typedef struct {
     size_t hist_n;
     size_t gen_default;
     int ready;
+    int loaded_ckpt; /* 1 = frozen checkpoint (no pretrain this boot) */
 } App;
 
 static void usage(const char *prog) {
-    printf("Usage: %s [--selfcheck] [--script PATH] [--help]\n", prog);
+    printf("Usage: %s [--selfcheck] [--script PATH] [--ckpt PATH] [--words PATH]\n", prog);
+    printf("       [--force-smoke-train] [--help]\n");
     printf("  nerva-train: one graph, one generate path (fluency + PCW).\n");
-    printf("  reply_source=fluency_generate  learn=fluency_pcw_teach_sequence  rgrad=OFF\n");
-    printf("  /seq w1 w2 ...     PCW-teach multi-token sequence\n");
-    printf("  /teach ...         alias for /seq\n");
-    printf("  /gen seed [n]      fluency_generate from seed\n");
-    printf("  /hist  /clear  /quit\n");
-    printf("  Free text: hist + fluency_generate (no templates).\n");
-    printf("  --selfcheck        automated PASS/FAIL\n");
+    printf("  Default boot: load frozen TinyStories checkpoint if present (no retrain).\n");
+    printf("  Pretrain once: make pretrain  →  checkpoints/tinystories.sess\n");
+    printf("  /seq /teach /gen /hist /clear /quit | free text\n");
+    printf("  --selfcheck   PASS/FAIL (uses ckpt if present, else smoke train)\n");
+    printf("  --force-smoke-train  ignore ckpt; tiny train.txt boot only\n");
 }
 
-static int app_boot(App *a) {
+/* Load frozen weights + word lexicon. Engine must be zeroed (not inited). */
+static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
+    FILE *cf;
+    long sz = 0;
+    memset(&a->eng, 0, sizeof(a->eng));
+    memset(&a->model, 0, sizeof(a->model));
+    fluency_words_init(&a->words);
+    if (fluency_load(&a->eng, &a->model, ckpt) != 0) {
+        fprintf(stderr, "boot: fluency_load failed path=%s\n", ckpt);
+        return -1;
+    }
+    if (nerva_words_load(&a->words, words_path) != 0) {
+        fprintf(stderr, "boot: words load failed path=%s\n", words_path);
+        fluency_free(&a->model);
+        nerva_engine_free(&a->eng);
+        return -1;
+    }
+    cf = fopen(ckpt, "rb");
+    if (cf) {
+        fseek(cf, 0, SEEK_END);
+        sz = ftell(cf);
+        fclose(cf);
+    }
+    nerva_work_set_rgrad_updates(0);
+    a->ready = 1;
+    a->loaded_ckpt = 1;
+    a->train_n = 0;
+    printf("boot_mode=LOAD_CHECKPOINT (no pretrain this launch)\n");
+    printf("ckpt=%s ckpt_bytes=%ld words=%s vocab=%u\n", ckpt, sz, words_path, a->words.count);
+    printf("boot: order=%u nodes=%u edges=%u\n", a->model.order, a->eng.node_count,
+           a->eng.edge_count);
+    printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
+    return 0;
+}
+
+/* Tiny smoke train — NOT TinyStories full; only when no ckpt / forced. */
+static int app_boot_smoke(App *a) {
     NervaConfig cfg = nerva_config_test();
     char *text = NULL;
     size_t text_len = 0;
     FILE *f;
     long sz;
 
-    memset(a, 0, sizeof(*a));
-    a->gen_default = 4;
     cfg.max_nodes = 4096;
     cfg.max_edges = 65536;
     cfg.max_names = 4096;
@@ -77,7 +115,7 @@ static int app_boot(App *a) {
     }
     fluency_words_init(&a->words);
 
-    f = fopen(CORPUS_PATH, "rb");
+    f = fopen(SMOKE_CORPUS, "rb");
     if (f) {
         if (fseek(f, 0, SEEK_END) == 0) {
             sz = ftell(f);
@@ -103,7 +141,6 @@ static int app_boot(App *a) {
             return -1;
         }
         strcpy(text, fallback);
-        text_len = strlen(text);
     }
 
     a->train_n = fluency_words_encode(&a->words, text, a->train_ids, 4096, 1);
@@ -117,10 +154,28 @@ static int app_boot(App *a) {
     a->model.fast_lambda = (nerva_uq0_16_t)(0.25 * 65535.0);
     nerva_work_set_rgrad_updates(0);
     a->ready = 1;
-    printf("boot: words=%u train_toks=%zu order=%u nodes=%u edges=%u\n",
-           a->words.count, a->train_n, a->model.order, a->eng.node_count, a->eng.edge_count);
+    a->loaded_ckpt = 0;
+    printf("boot_mode=SMOKE_TRAIN (not full TinyStories — run make pretrain for ckpt)\n");
+    printf("boot: words=%u train_toks=%zu order=%u nodes=%u edges=%u\n", a->words.count, a->train_n,
+           a->model.order, a->eng.node_count, a->eng.edge_count);
     printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
     return 0;
+}
+
+static int app_boot(App *a, const char *ckpt, const char *words_path, int force_smoke) {
+    FILE *cf;
+    memset(a, 0, sizeof(*a));
+    a->gen_default = 4;
+    if (!force_smoke && ckpt && words_path) {
+        cf = fopen(ckpt, "rb");
+        if (cf) {
+            fclose(cf);
+            if (app_boot_ckpt(a, ckpt, words_path) == 0)
+                return 0;
+            printf("boot: ckpt load failed; falling back to smoke train\n");
+        }
+    }
+    return app_boot_smoke(a);
 }
 
 static void app_free(App *a) {
@@ -443,7 +498,10 @@ static int run_script(App *a, const char *path, FILE *out) {
 int main(int argc, char **argv) {
     App *app;
     int selfcheck = 0;
+    int force_smoke = 0;
     const char *script = NULL;
+    const char *ckpt = DEFAULT_CKPT;
+    const char *words_path = DEFAULT_WORDS;
     int i;
     char line[512];
     int rc = 0;
@@ -454,6 +512,12 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(argv[i], "--selfcheck") == 0) {
             selfcheck = 1;
+        } else if (strcmp(argv[i], "--force-smoke-train") == 0) {
+            force_smoke = 1;
+        } else if (strcmp(argv[i], "--ckpt") == 0 && i + 1 < argc) {
+            ckpt = argv[++i];
+        } else if (strcmp(argv[i], "--words") == 0 && i + 1 < argc) {
+            words_path = argv[++i];
         } else if (strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
             script = argv[++i];
         } else {
@@ -471,16 +535,18 @@ int main(int argc, char **argv) {
 
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("nerva-train — teach + chat (fluency + PCW)\n");
-    if (app_boot(app) != 0) {
+    if (app_boot(app, ckpt, words_path, force_smoke) != 0) {
         fprintf(stderr, "boot failed\n");
         free(app);
         return 1;
     }
-    printf("rgrad_updates_enabled=%d (must be 0)\n", nerva_work_rgrad_updates_enabled());
+    printf("rgrad_updates_enabled=%d (must be 0) loaded_ckpt=%d\n",
+           nerva_work_rgrad_updates_enabled(), app->loaded_ckpt);
     printf("commands: /seq /teach /gen /hist /clear /quit  |  free text\n");
 
     if (selfcheck) {
         rc = run_selfcheck(app, stdout);
+        printf("boot_was_load_ckpt=%d\n", app->loaded_ckpt);
         app_free(app);
         free(app);
         return rc;
