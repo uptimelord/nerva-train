@@ -14,23 +14,35 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- CRC helpers (reuse engine CRC32) ------------------------------------ */
+/* ---- CRC helpers (same poly as nerva_persist_crc32, streaming form) ------ */
 
-static void sess_crc_update(uint32_t *crc, const void *data, size_t len) {
-    if (!crc || !data || len == 0u) {
+static uint32_t g_scrc_table[256];
+static int g_scrc_ready = 0;
+
+static void sess_crc_init(void) {
+    uint32_t i;
+    if (g_scrc_ready) {
         return;
     }
-    /* Incremental: fold via full-buffer recompute is O(n²); use byte loop with
-     * the public API by XOR-composing is not exposed. Recompute over streaming
-     * by maintaining running CRC with the same poly as nerva_persist_crc32.
-     * We call nerva_persist_crc32 on chunks by combining: final = crc32(all).
-     * For write path we accumulate into a growable buffer is heavy; instead
-     * mirror the update used in nerva_persist (table not public). Simplest
-     * correct approach: write blobs, then CRC the payload range by re-read.
-     * Write path: two-pass — write payload first, CRC, then rewrite header. */
-    (void)crc;
-    (void)data;
-    (void)len;
+    for (i = 0; i < 256u; ++i) {
+        uint32_t c = i;
+        int j;
+        for (j = 0; j < 8; ++j) {
+            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        g_scrc_table[i] = c;
+    }
+    g_scrc_ready = 1;
+}
+
+/* crc state starts at 0xFFFFFFFF; finalize with ^0xFFFFFFFF. */
+static void sess_crc_update(uint32_t *crc, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    size_t i;
+    sess_crc_init();
+    for (i = 0; i < len; ++i) {
+        *crc = g_scrc_table[(*crc ^ p[i]) & 0xFFu] ^ (*crc >> 8);
+    }
 }
 
 static int write_all(FILE *f, const void *data, size_t n) {
@@ -59,41 +71,6 @@ static int path_tmp(const char *path, char *out, size_t out_cap, const char *suf
     memcpy(out, path, n);
     memcpy(out + n, suffix, sn + 1u);
     return 0;
-}
-
-static uint8_t *read_file_bytes(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    long sz = ftell(f);
-    if (sz < 0) {
-        fclose(f);
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf && sz > 0) {
-        fclose(f);
-        return NULL;
-    }
-    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    if (out_len) {
-        *out_len = (size_t)sz;
-    }
-    return buf;
 }
 
 /* ---- Fluency side blob --------------------------------------------------- */
@@ -589,17 +566,26 @@ int fluency_session_save(const FluencyModel *m, const char *path, const uint8_t 
     if (nerva_persist_save(m->e, eng_path) != 0) {
         return -1;
     }
-    size_t eng_len = 0;
-    uint8_t *eng = read_file_bytes(eng_path, &eng_len);
-    remove(eng_path);
-    if (!eng && eng_len > 0u) {
+    /* Engine blob stays on disk; it is streamed (CRC + copy), never held whole
+     * in memory — keeps save transient footprint ≈ fluency side blob only. */
+    FILE *ef = fopen(eng_path, "rb");
+    if (!ef) {
+        remove(eng_path);
         return -1;
     }
+    long eng_sz = 0;
+    if (fseek(ef, 0, SEEK_END) != 0 || (eng_sz = ftell(ef)) < 0 || fseek(ef, 0, SEEK_SET) != 0) {
+        fclose(ef);
+        remove(eng_path);
+        return -1;
+    }
+    size_t eng_len = (size_t)eng_sz;
 
     uint8_t *flu = NULL;
     size_t flu_len = 0;
     if (fluency_side_encode(m, &flu, &flu_len) != 0) {
-        free(eng);
+        fclose(ef);
+        remove(eng_path);
         return -1;
     }
 
@@ -626,46 +612,73 @@ int fluency_session_save(const FluencyModel *m, const char *path, const uint8_t 
     h.chat_size = (uint64_t)chat_len;
     h.file_size = h.chat_offset + h.chat_size;
 
-    /* Payload CRC over concatenated sections. */
-    size_t pay_len = eng_len + flu_len + chat_len;
-    uint8_t *pay = (uint8_t *)malloc(pay_len ? pay_len : 1u);
-    if (!pay) {
-        free(eng);
+    enum { COPY_CHUNK = 1u << 20 };
+    uint8_t *cbuf = (uint8_t *)malloc(COPY_CHUNK);
+    if (!cbuf) {
+        fclose(ef);
+        remove(eng_path);
         free(flu);
         return -1;
     }
-    size_t po = 0;
-    if (eng_len) {
-        memcpy(pay + po, eng, eng_len);
-        po += eng_len;
+
+    /* Payload CRC streamed over engine file + flu blob + chat blob. */
+    uint32_t crc = 0xFFFFFFFFu;
+    size_t left = eng_len;
+    while (left > 0u) {
+        size_t want = left < COPY_CHUNK ? left : COPY_CHUNK;
+        if (fread(cbuf, 1, want, ef) != want) {
+            fclose(ef);
+            remove(eng_path);
+            free(flu);
+            free(cbuf);
+            return -1;
+        }
+        sess_crc_update(&crc, cbuf, want);
+        left -= want;
     }
-    if (flu_len) {
-        memcpy(pay + po, flu, flu_len);
-        po += flu_len;
-    }
+    sess_crc_update(&crc, flu, flu_len);
     if (chat_len) {
-        memcpy(pay + po, chat, chat_len);
-        po += chat_len;
+        sess_crc_update(&crc, chat, chat_len);
     }
-    h.payload_crc32 = nerva_persist_crc32(pay, pay_len);
+    h.payload_crc32 = crc ^ 0xFFFFFFFFu;
     h.header_crc32 = 0;
     h.header_crc32 = nerva_persist_crc32((const uint8_t *)&h, sizeof(h));
 
     FILE *out = fopen(path, "wb");
     if (!out) {
-        free(eng);
+        fclose(ef);
+        remove(eng_path);
         free(flu);
-        free(pay);
+        free(cbuf);
         return -1;
     }
     int rc = 0;
-    if (write_all(out, &h, sizeof(h)) != 0 || write_all(out, pay, pay_len) != 0) {
+    if (write_all(out, &h, sizeof(h)) != 0) {
         rc = -1;
     }
+    if (rc == 0 && fseek(ef, 0, SEEK_SET) != 0) {
+        rc = -1;
+    }
+    left = eng_len;
+    while (rc == 0 && left > 0u) {
+        size_t want = left < COPY_CHUNK ? left : COPY_CHUNK;
+        if (fread(cbuf, 1, want, ef) != want || write_all(out, cbuf, want) != 0) {
+            rc = -1;
+            break;
+        }
+        left -= want;
+    }
+    if (rc == 0 && write_all(out, flu, flu_len) != 0) {
+        rc = -1;
+    }
+    if (rc == 0 && chat_len && write_all(out, chat, chat_len) != 0) {
+        rc = -1;
+    }
+    fclose(ef);
+    remove(eng_path);
     fclose(out);
-    free(eng);
     free(flu);
-    free(pay);
+    free(cbuf);
     return rc;
 }
 
@@ -883,7 +896,6 @@ int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint
     }
 
     free(pay);
-    (void)sess_crc_update;
     return 0;
 }
 

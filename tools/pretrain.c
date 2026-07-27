@@ -232,8 +232,10 @@ static flu_tok_t idmap_get(const IdSlot *tab, const char *w) {
 }
 
 static void usage(const char *p) {
-    printf("Usage: %s [--corpus PATH] [--ckpt PATH] [--words PATH] [--meta PATH]\n", p);
+    printf("Usage: %s [--corpus PATH] [--ckpt PATH] [--words PATH] [--meta PATH] [--fresh]\n",
+           p);
     printf("  Full TinyStories stream pretrain → frozen checkpoint.\n");
+    printf("  Auto-resumes from <ckpt>.partial if present; --fresh ignores it.\n");
     printf("  default corpus=%s\n", DEFAULT_CORPUS);
     printf("  default ckpt=%s\n", DEFAULT_CKPT);
 }
@@ -260,6 +262,9 @@ int main(int argc, char **argv) {
     uint64_t trained = 0, oov = 0;
     uint64_t last_ckpt = 0;
     char part_path[1024];
+    char part_meta[1040];
+    int resume = 0, force_fresh = 0;
+    uint64_t resume_toks = 0;
     long corpus_bytes = 0;
     BufIn bin;
 
@@ -275,6 +280,8 @@ int main(int argc, char **argv) {
             words_path = argv[++i];
         else if (strcmp(argv[i], "--meta") == 0 && i + 1 < argc)
             meta_path = argv[++i];
+        else if (strcmp(argv[i], "--fresh") == 0)
+            force_fresh = 1;
         else {
             fprintf(stderr, "unknown %s\n", argv[i]);
             usage(argv[0]);
@@ -284,7 +291,30 @@ int main(int argc, char **argv) {
 
     setvbuf(stdout, NULL, _IONBF, 0);
     snprintf(part_path, sizeof(part_path), "%s.partial", ckpt);
+    snprintf(part_meta, sizeof(part_meta), "%s.partial.meta", ckpt);
+    if (!force_fresh) {
+        FILE *pm = fopen(part_meta, "rb");
+        if (pm) {
+            unsigned long long t = 0;
+            if (fscanf(pm, "trained_toks=%llu", &t) == 1 && t > 0) {
+                FILE *pf = fopen(part_path, "rb");
+                FILE *wf = fopen(words_path, "rb");
+                if (pf && wf) {
+                    resume = 1;
+                    resume_toks = (uint64_t)t;
+                }
+                if (pf)
+                    fclose(pf);
+                if (wf)
+                    fclose(wf);
+            }
+            fclose(pm);
+        }
+    }
     printf("=== TinyStories FULL pretrain ===\n");
+    if (resume)
+        printf("RESUME from %s at trained_toks=%llu (use --fresh to restart)\n", part_path,
+               (unsigned long long)resume_toks);
     printf("corpus=%s\n", corpus);
     printf("ckpt=%s\nwords=%s\n", ckpt, words_path);
 
@@ -305,63 +335,78 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    tab = (FreqSlot *)calloc(FREQ_SLOTS, sizeof(FreqSlot));
-    if (!tab) {
+    if (!resume) {
+        tab = (FreqSlot *)calloc(FREQ_SLOTS, sizeof(FreqSlot));
+        if (!tab) {
+            fclose(f);
+            return 1;
+        }
+        if (buf_open(&bin, f) != 0) {
+            free(tab);
+            fclose(f);
+            return 1;
+        }
+        t0 = wall_sec();
+        printf("pass1: counting words over full corpus (hash)...\n");
+        while (next_word(&bin, wbuf)) {
+            total_words++;
+            if (freq_add(tab, &nused, wbuf) != 0)
+                dropped++;
+            if ((total_words % 5000000ull) == 0ull)
+                printf("  pass1 words=%llu unique=%u rss_MiB=%.1f\n",
+                       (unsigned long long)total_words, nused,
+                       (double)process_rss() / (1024.0 * 1024.0));
+        }
+        buf_close(&bin);
         fclose(f);
-        return 1;
-    }
-    if (buf_open(&bin, f) != 0) {
-        free(tab);
-        fclose(f);
-        return 1;
-    }
-    t0 = wall_sec();
-    printf("pass1: counting words over full corpus (hash)...\n");
-    while (next_word(&bin, wbuf)) {
-        total_words++;
-        if (freq_add(tab, &nused, wbuf) != 0)
-            dropped++;
-        if ((total_words % 5000000ull) == 0ull)
-            printf("  pass1 words=%llu unique=%u rss_MiB=%.1f\n", (unsigned long long)total_words,
-                   nused, (double)process_rss() / (1024.0 * 1024.0));
-    }
-    buf_close(&bin);
-    fclose(f);
-    printf("pass1 done words=%llu unique=%u dropped_new=%llu wall_s=%.1f\n",
-           (unsigned long long)total_words, nused, (unsigned long long)dropped, wall_sec() - t0);
+        printf("pass1 done words=%llu unique=%u dropped_new=%llu wall_s=%.1f\n",
+               (unsigned long long)total_words, nused, (unsigned long long)dropped,
+               wall_sec() - t0);
 
-    qsort(tab, FREQ_SLOTS, sizeof(FreqSlot), cmp_freq_desc);
+        qsort(tab, FREQ_SLOTS, sizeof(FreqSlot), cmp_freq_desc);
+    } else {
+        fclose(f);
+    }
 
     W = (FluencyWords *)calloc(1, sizeof(*W));
     if (!W) {
         free(tab);
         return 1;
     }
-    fluency_words_init(W);
-    strncpy(W->word[0], "<unk>", FLUENCY_WORD_LEN);
-    W->freq[0] = 0;
-    W->count = 1;
-    {
-        uint32_t k, limit = VOCAB_CAP - 1u;
-        if (nused < limit)
-            limit = nused;
-        for (k = 0; k < limit; ++k) {
-            uint32_t id;
-            if (!tab[k].used)
-                break;
-            id = W->count;
-            strncpy(W->word[id], tab[k].w, FLUENCY_WORD_LEN);
-            W->word[id][FLUENCY_WORD_LEN] = 0;
-            W->freq[id] = tab[k].n;
-            W->count++;
+    if (!resume) {
+        fluency_words_init(W);
+        strncpy(W->word[0], "<unk>", FLUENCY_WORD_LEN);
+        W->freq[0] = 0;
+        W->count = 1;
+        {
+            uint32_t k, limit = VOCAB_CAP - 1u;
+            if (nused < limit)
+                limit = nused;
+            for (k = 0; k < limit; ++k) {
+                uint32_t id;
+                if (!tab[k].used)
+                    break;
+                id = W->count;
+                strncpy(W->word[id], tab[k].w, FLUENCY_WORD_LEN);
+                W->word[id][FLUENCY_WORD_LEN] = 0;
+                W->freq[id] = tab[k].n;
+                W->count++;
+            }
         }
+        free(tab);
+        tab = NULL;
+        printf("vocab sealed count=%u (incl <unk>)\n", W->count);
+        /* Words written now so a partial checkpoint is loadable mid-run. */
+        if (nerva_words_save(W, words_path) != 0)
+            fprintf(stderr, "WARN early words save failed %s\n", words_path);
+    } else {
+        if (nerva_words_load(W, words_path) != 0) {
+            fprintf(stderr, "FAIL resume: cannot load words %s\n", words_path);
+            free(W);
+            return 1;
+        }
+        printf("vocab loaded count=%u from %s\n", W->count, words_path);
     }
-    free(tab);
-    tab = NULL;
-    printf("vocab sealed count=%u (incl <unk>)\n", W->count);
-    /* Words written now so a partial checkpoint is loadable mid-run. */
-    if (nerva_words_save(W, words_path) != 0)
-        fprintf(stderr, "WARN early words save failed %s\n", words_path);
 
     idmap = (IdSlot *)calloc(ID_SLOTS, sizeof(IdSlot));
     if (!idmap) {
@@ -374,36 +419,50 @@ int main(int argc, char **argv) {
             idmap_put(idmap, W->word[k], (flu_tok_t)k);
     }
 
-    cfg = nerva_config_default();
-    cfg.weight_max_q8_8 = INT16_MAX;
-    cfg.max_nodes = 800000u;
-    cfg.max_edges = 6000000u;
-    cfg.max_names = 800000u;
-    cfg.max_events = (uint32_t)FLUENCY_VOCAB * 2u + 4096u;
-    cfg.max_active_nodes = 8192u;
-    cfg.max_fire_log = 4096u;
-    cfg.max_traces = 16384u;
-    cfg.max_mutations = 4096u;
-    cfg.max_mutation_log = 4096u;
-    cfg.max_schemas = 64u;
-    cfg.max_memory_blocks = 64u;
-    cfg.max_expectations = 64u;
+    if (!resume) {
+        cfg = nerva_config_default();
+        cfg.weight_max_q8_8 = INT16_MAX;
+        cfg.max_nodes = 800000u;
+        cfg.max_edges = 6000000u;
+        cfg.max_names = 800000u;
+        cfg.max_events = (uint32_t)FLUENCY_VOCAB * 2u + 4096u;
+        cfg.max_active_nodes = 8192u;
+        cfg.max_fire_log = 4096u;
+        cfg.max_traces = 16384u;
+        cfg.max_mutations = 4096u;
+        cfg.max_mutation_log = 4096u;
+        cfg.max_schemas = 64u;
+        cfg.max_memory_blocks = 64u;
+        cfg.max_expectations = 64u;
 
-    printf("engine caps nodes=%u edges=%u names=%u\n", cfg.max_nodes, cfg.max_edges, cfg.max_names);
-    if (nerva_engine_init(&eng, cfg) != 0) {
-        fprintf(stderr, "FAIL engine init\n");
-        free(idmap);
-        free(W);
-        return 1;
+        printf("engine caps nodes=%u edges=%u names=%u\n", cfg.max_nodes, cfg.max_edges,
+               cfg.max_names);
+        if (nerva_engine_init(&eng, cfg) != 0) {
+            fprintf(stderr, "FAIL engine init\n");
+            free(idmap);
+            free(W);
+            return 1;
+        }
+        if (fluency_init(&model, &eng, 3u) != 0) {
+            fprintf(stderr, "FAIL fluency init\n");
+            nerva_engine_free(&eng);
+            free(idmap);
+            free(W);
+            return 1;
+        }
+        model.fast_lambda = (nerva_uq0_16_t)(0.15 * 65535.0);
+    } else {
+        memset(&eng, 0, sizeof(eng));
+        memset(&model, 0, sizeof(model));
+        if (fluency_load(&eng, &model, part_path) != 0) {
+            fprintf(stderr, "FAIL resume: cannot load partial ckpt %s\n", part_path);
+            free(idmap);
+            free(W);
+            return 1;
+        }
+        printf("resume: model loaded order=%u nodes=%u edges=%u\n", model.order, eng.node_count,
+               eng.edge_count);
     }
-    if (fluency_init(&model, &eng, 3u) != 0) {
-        fprintf(stderr, "FAIL fluency init\n");
-        nerva_engine_free(&eng);
-        free(idmap);
-        free(W);
-        return 1;
-    }
-    model.fast_lambda = (nerva_uq0_16_t)(0.15 * 65535.0);
     nerva_work_set_rgrad_updates(0);
 
     chunk = (flu_tok_t *)malloc(sizeof(flu_tok_t) * CHUNK_TOKS);
@@ -436,6 +495,28 @@ int main(int argc, char **argv) {
 
     t0 = wall_sec();
     printf("pass2: streaming train over FULL corpus (online fluency_train)...\n");
+    if (resume) {
+        uint64_t skipped = 0;
+        printf("resume: skipping %llu already-trained tokens...\n",
+               (unsigned long long)resume_toks);
+        while (skipped < resume_toks && next_word(&bin, wbuf))
+            skipped++;
+        if (skipped != resume_toks) {
+            fprintf(stderr, "FAIL resume: corpus ended at %llu < resume point %llu\n",
+                    (unsigned long long)skipped, (unsigned long long)resume_toks);
+            buf_close(&bin);
+            fclose(f);
+            free(chunk);
+            fluency_free(&model);
+            nerva_engine_free(&eng);
+            free(idmap);
+            free(W);
+            return 1;
+        }
+        trained = resume_toks;
+        last_ckpt = resume_toks;
+        printf("resume: skip done wall_s=%.1f\n", wall_sec() - t0);
+    }
     cn = 0;
     while (next_word(&bin, wbuf)) {
         flu_tok_t id = idmap_get(idmap, wbuf);
@@ -453,11 +534,17 @@ int main(int argc, char **argv) {
             }
             if (trained - last_ckpt >= SAVE_EVERY_TOKS) {
                 double ts = wall_sec();
-                if (fluency_save(&model, part_path) == 0)
+                if (fluency_save(&model, part_path) == 0) {
+                    FILE *pm = fopen(part_meta, "wb");
+                    if (pm) {
+                        fprintf(pm, "trained_toks=%llu\n", (unsigned long long)trained);
+                        fclose(pm);
+                    }
                     printf("  partial ckpt trained_toks=%llu path=%s save_s=%.1f\n",
                            (unsigned long long)trained, part_path, wall_sec() - ts);
-                else
+                } else {
                     fprintf(stderr, "WARN partial ckpt save failed %s\n", part_path);
+                }
                 last_ckpt = trained;
             }
         }
@@ -488,6 +575,7 @@ int main(int argc, char **argv) {
     printf("saving checkpoint...\n");
     if (fluency_save(&model, ckpt) == 0) {
         remove(part_path);
+        remove(part_meta);
     } else {
         fprintf(stderr, "FAIL fluency_save %s\n", ckpt);
         fluency_free(&model);
