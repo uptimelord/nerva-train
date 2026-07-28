@@ -2731,7 +2731,7 @@ void fluency_generate(FluencyModel *m, const flu_tok_t *seed, size_t seed_len,
         if (ctx_len < m->order) {
             ctx[ctx_len++] = (flu_tok_t)pick;
         } else {
-            memmove(ctx, ctx + 1, m->order - 1u);
+            memmove(ctx, ctx + 1, (size_t)(m->order - 1u) * sizeof(flu_tok_t));
             ctx[m->order - 1u] = (flu_tok_t)pick;
         }
     }
