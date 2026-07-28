@@ -2743,6 +2743,8 @@ void fluency_generate(FluencyModel *m, const flu_tok_t *seed, size_t seed_len,
 #define FLU_PCW_DELTA ((int16_t)48)
 #define FLU_PCW_PASSES 4
 #define FLU_PCW_MAX_CAND 48
+#define FLU_PCW_ESC_MAX_ROUNDS 24
+#define FLU_PCW_ESC_DELTA_CAP 8192
 
 static double fluency_pcw_soft_loss(const double *dist, flu_tok_t gold) {
     double p;
@@ -2772,6 +2774,14 @@ static uint32_t fluency_pcw_ensure_edge(FluencyModel *m, uint32_t ctx, flu_tok_t
         nerva_graph_rebuild_adjacency(m->e);
     }
     return *slot;
+}
+
+static nerva_q8_8_t fluency_pcw_clamp_w(int32_t w) {
+    if (w > 32767)
+        return (nerva_q8_8_t)32767;
+    if (w < -32768)
+        return (nerva_q8_8_t)-32768;
+    return (nerva_q8_8_t)w;
 }
 
 /* One next-token position: PCW ±δ on outgoing ctx edges under fluency_predict Q. */
@@ -2835,7 +2845,7 @@ static int fluency_pcw_teach_pos(FluencyModel *m, const flu_tok_t *text, size_t 
         uint32_t eid = cands[c];
         nerva_q8_8_t wsave = m->e->edges[eid].weight;
         /* +δ */
-        m->e->edges[eid].weight = (nerva_q8_8_t)(wsave + FLU_PCW_DELTA);
+        m->e->edges[eid].weight = fluency_pcw_clamp_w((int32_t)wsave + (int32_t)FLU_PCW_DELTA);
         (void)fluency_predict(m, text + (i - k), (size_t)k, dist);
         loss = fluency_pcw_soft_loss(dist, gold);
         m->e->edges[eid].weight = wsave;
@@ -2844,7 +2854,7 @@ static int fluency_pcw_teach_pos(FluencyModel *m, const flu_tok_t *text, size_t 
             best_pos_eid = eid;
         }
         /* −δ */
-        m->e->edges[eid].weight = (nerva_q8_8_t)(wsave - FLU_PCW_DELTA);
+        m->e->edges[eid].weight = fluency_pcw_clamp_w((int32_t)wsave - (int32_t)FLU_PCW_DELTA);
         (void)fluency_predict(m, text + (i - k), (size_t)k, dist);
         loss = fluency_pcw_soft_loss(dist, gold);
         m->e->edges[eid].weight = wsave;
@@ -2868,6 +2878,116 @@ static int fluency_pcw_teach_pos(FluencyModel *m, const flu_tok_t *text, size_t 
     return applied;
 }
 
+/*
+ * Escalating PCW after the fixed ±24×4 passes.
+ *
+ * A one-shot taught fact must override a saturated pretrain habit; ±24×4 cannot
+ * close a ~32k q8.8 gap. Doubling probes commit the smallest measured-useful
+ * deltas (multiscale quanta). Demoting the measured argmax competitor is the
+ * surgical edit — only this position's own context edges are touched.
+ */
+static int fluency_pcw_teach_pos_escalate(FluencyModel *m, const flu_tok_t *text, size_t i) {
+    uint32_t k, ctx, gold_e;
+    flu_tok_t gold;
+    double *dist;
+    double l0;
+    int applied = 0;
+    int round;
+    int32_t delta_i;
+
+    if (!m || !text || i == 0)
+        return 0;
+    gold = text[i];
+    if (fluency_ensure_tok(m, gold) != 0)
+        return -1;
+    for (size_t j = 0; j < i; ++j) {
+        if (fluency_ensure_tok(m, text[j]) != 0)
+            return -1;
+    }
+
+    k = m->order;
+    if ((size_t)k > i)
+        k = (uint32_t)i;
+    if (k == 0)
+        return 0;
+    ctx = fluency_get_ctx(m, text + (i - k), k);
+    if (ctx == NERVA_INVALID_ID)
+        return -1;
+    gold_e = fluency_pcw_ensure_edge(m, ctx, gold);
+    if (gold_e == NERVA_INVALID_ID)
+        return -1;
+
+    dist = (double *)calloc((size_t)FLUENCY_VOCAB, sizeof(double));
+    if (!dist)
+        return -1;
+
+    delta_i = (int32_t)FLU_PCW_DELTA;
+    for (round = 0; round < FLU_PCW_ESC_MAX_ROUNDS; ++round) {
+        int pick;
+        int16_t d;
+        int do_pos = 0, do_neg = 0;
+        uint32_t *comp_slot;
+        uint32_t comp_e = NERVA_INVALID_ID;
+        nerva_q8_8_t wsave;
+        double loss;
+
+        pick = fluency_predict(m, text + (i - k), (size_t)k, dist);
+        if (pick == (int)gold)
+            break;
+
+        if (delta_i > FLU_PCW_ESC_DELTA_CAP)
+            delta_i = FLU_PCW_ESC_DELTA_CAP;
+        d = (int16_t)delta_i;
+        l0 = fluency_pcw_soft_loss(dist, gold);
+
+        /* (b) look up argmax competitor — never mint a missing edge. */
+        if (pick >= 0 && (flu_tok_t)pick != gold && (flu_tok_t)pick < FLUENCY_VOCAB) {
+            comp_slot = fluency_slot_ref(m, fluency_slot_key(ctx, (flu_tok_t)pick));
+            if (comp_slot && *comp_slot != NERVA_INVALID_ID)
+                comp_e = *comp_slot;
+        }
+
+        /* Probe both sides against the same baseline, then commit via work path. */
+        wsave = m->e->edges[gold_e].weight;
+        m->e->edges[gold_e].weight = fluency_pcw_clamp_w((int32_t)wsave + (int32_t)d);
+        (void)fluency_predict(m, text + (i - k), (size_t)k, dist);
+        loss = fluency_pcw_soft_loss(dist, gold);
+        m->e->edges[gold_e].weight = wsave;
+        if (loss < l0 - 1e-15)
+            do_pos = 1;
+
+        if (comp_e != NERVA_INVALID_ID) {
+            wsave = m->e->edges[comp_e].weight;
+            m->e->edges[comp_e].weight = fluency_pcw_clamp_w((int32_t)wsave - (int32_t)d);
+            (void)fluency_predict(m, text + (i - k), (size_t)k, dist);
+            loss = fluency_pcw_soft_loss(dist, gold);
+            m->e->edges[comp_e].weight = wsave;
+            if (loss < l0 - 1e-15)
+                do_neg = 1;
+        }
+
+        if (do_pos) {
+            if (nerva_work_apply_weight_delta(m->e, gold_e, (nerva_q8_8_t)d,
+                                             NERVA_REASON_HEBBIAN_COFIRE))
+                applied = 1;
+        }
+        if (do_neg) {
+            if (nerva_work_apply_weight_delta(m->e, comp_e, (nerva_q8_8_t)(-d),
+                                             NERVA_REASON_HEBBIAN_COFIRE))
+                applied = 1;
+        }
+
+        if (delta_i < FLU_PCW_ESC_DELTA_CAP) {
+            delta_i *= 2;
+            if (delta_i > FLU_PCW_ESC_DELTA_CAP)
+                delta_i = FLU_PCW_ESC_DELTA_CAP;
+        }
+    }
+
+    free(dist);
+    return applied ? 1 : 0;
+}
+
 int fluency_pcw_teach_sequence(FluencyModel *m, const flu_tok_t *text, size_t n) {
     int applied = 0;
     int pass;
@@ -2884,7 +3004,17 @@ int fluency_pcw_teach_sequence(FluencyModel *m, const flu_tok_t *text, size_t n)
                 applied = 1;
         }
     }
+    /* Escalation: grow deltas until gold is argmax on each position's context. */
+    for (i = 1; i < n; ++i) {
+        int rc = fluency_pcw_teach_pos_escalate(m, text, i);
+        if (rc < 0)
+            return -1;
+        if (rc > 0)
+            applied = 1;
+    }
     nerva_graph_rebuild_adjacency(m->e);
+    /* Match fluency_train: episodic fast deposits on every taught transition. */
+    fluency_fast_deposit_stream(m, text, n);
     return applied ? 1 : 0;
 }
 

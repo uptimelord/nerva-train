@@ -44,17 +44,20 @@ typedef struct {
     size_t gen_default;
     int ready;
     int loaded_ckpt; /* 1 = frozen checkpoint (no pretrain this boot) */
+    int sample_on;   /* 0 = greedy (default); 1 = sample from fluency_generate dist */
+    uint32_t rng_counter; /* incremented per sampled generate for varied seeds */
 } App;
 
 static void usage(const char *prog) {
     printf("Usage: %s [--selfcheck] [--script PATH] [--ckpt PATH] [--words PATH]\n", prog);
-    printf("       [--force-smoke-train] [--help]\n");
+    printf("       [--force-smoke-train] [--sample] [--help]\n");
     printf("  nerva-train: one graph, one generate path (fluency + PCW).\n");
     printf("  Default boot: load frozen TinyStories checkpoint if present (no retrain).\n");
     printf("  Pretrain once: make pretrain  →  checkpoints/tinystories.sess\n");
-    printf("  /seq /teach /gen /hist /clear /quit | free text\n");
+    printf("  /seq /teach /gen /sample /hist /clear /quit | free text\n");
     printf("  --selfcheck   PASS/FAIL (uses ckpt if present, else smoke train)\n");
     printf("  --force-smoke-train  ignore ckpt; tiny train.txt boot only\n");
+    printf("  --sample      enable multinomial sampling (default: greedy)\n");
 }
 
 /* Load frozen weights + word lexicon. Engine must be zeroed (not inited). */
@@ -81,6 +84,10 @@ static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
         sz = ftell(cf);
         fclose(cf);
     }
+    /* Lab chat organism settings. Checkpoint stores λ≈0.15 / w0=4, which make
+     * inject = weff*λ>>16 round to 0 (fast path a no-op). */
+    a->model.fast_lambda = (nerva_uq0_16_t)(0.5 * 65535.0);
+    a->model.fast_w0 = (nerva_q8_8_t)2048;
     nerva_work_set_rgrad_updates(0);
     a->ready = 1;
     a->loaded_ckpt = 1;
@@ -89,6 +96,8 @@ static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
     printf("ckpt=%s ckpt_bytes=%ld words=%s vocab=%u\n", ckpt, sz, words_path, a->words.count);
     printf("boot: order=%u nodes=%u/%u edges=%u/%u (teach headroom loaded)\n", a->model.order,
            a->eng.node_count, a->eng.node_cap, a->eng.edge_count, a->eng.edge_cap);
+    printf("fast_lambda=%u fast_w0=%d (lab chat; ckpt λ/w0 were no-op)\n",
+           (unsigned)a->model.fast_lambda, (int)a->model.fast_w0);
     printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
     return 0;
 }
@@ -242,10 +251,17 @@ static int do_seq(App *a, const char *line, FILE *out) {
 static int generate_from(App *a, const flu_tok_t *seed, size_t seed_n, size_t n_gen, flu_tok_t *gen,
                          uint64_t *apply_delta) {
     uint64_t a0, a1;
+    uint32_t rng_seed = 1u;
+    int sample = 0;
     if (!seed || seed_n < 1 || n_gen < 1)
         return -1;
+    if (a->sample_on) {
+        sample = 1;
+        a->rng_counter++;
+        rng_seed = a->rng_counter ? a->rng_counter : 1u;
+    }
     a0 = nerva_work_pcw_apply_count();
-    fluency_generate(&a->model, seed, seed_n, gen, n_gen, 1u, 0);
+    fluency_generate(&a->model, seed, seed_n, gen, n_gen, rng_seed, sample);
     a1 = nerva_work_pcw_apply_count();
     if (apply_delta)
         *apply_delta = a1 - a0;
@@ -274,8 +290,8 @@ static int do_gen(App *a, const char *seed_word, size_t n_gen, FILE *out) {
     fprintf(out, "nerva> ");
     print_tokens(a, gen, n_gen, out);
     fprintf(out, "\n");
-    fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d]\n", n_gen,
-            (unsigned long long)d, !nerva_work_rgrad_updates_enabled());
+    fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d sample=%d]\n",
+            n_gen, (unsigned long long)d, !nerva_work_rgrad_updates_enabled(), a->sample_on);
     hist_push(a, seed, 1);
     hist_push(a, gen, n_gen);
     (void)i;
@@ -310,8 +326,8 @@ static int do_freechat(App *a, const char *line, FILE *out) {
     fprintf(out, "nerva> ");
     print_tokens(a, gen, n_gen, out);
     fprintf(out, "\n");
-    fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d]\n", n_gen,
-            (unsigned long long)d, !nerva_work_rgrad_updates_enabled());
+    fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d sample=%d]\n",
+            n_gen, (unsigned long long)d, !nerva_work_rgrad_updates_enabled(), a->sample_on);
     hist_push(a, gen, n_gen);
     return 0;
 }
@@ -334,6 +350,9 @@ static int run_selfcheck(App *a, FILE *out) {
     size_t n = 0, n_want;
     int ok = 1, match = 0, rgrad_ok = 0;
     uint64_t a0, a1, r0, d = 0;
+
+    /* Selfcheck requires deterministic greedy generation regardless of --sample. */
+    a->sample_on = 0;
 
     fprintf(out, "nerva-train selfcheck — single stack\n");
     fprintf(out, "AUDIT reply_source=fluency_generate (not template)\n");
@@ -448,6 +467,11 @@ static int handle_line(App *a, char *line, FILE *out) {
         fprintf(out, "hist cleared\n");
         return 1;
     }
+    if (strcmp(line, "/sample") == 0) {
+        a->sample_on = a->sample_on ? 0 : 1;
+        fprintf(out, "sample=%s\n", a->sample_on ? "on" : "off");
+        return 1;
+    }
     if (strncmp(line, "/seq ", 5) == 0) {
         (void)do_seq(a, line + 5, out);
         return 1;
@@ -506,6 +530,7 @@ int main(int argc, char **argv) {
     App *app;
     int selfcheck = 0;
     int force_smoke = 0;
+    int sample_flag = 0;
     const char *script = NULL;
     const char *ckpt = DEFAULT_CKPT;
     const char *words_path = DEFAULT_WORDS;
@@ -521,6 +546,8 @@ int main(int argc, char **argv) {
             selfcheck = 1;
         } else if (strcmp(argv[i], "--force-smoke-train") == 0) {
             force_smoke = 1;
+        } else if (strcmp(argv[i], "--sample") == 0) {
+            sample_flag = 1;
         } else if (strcmp(argv[i], "--ckpt") == 0 && i + 1 < argc) {
             ckpt = argv[++i];
         } else if (strcmp(argv[i], "--words") == 0 && i + 1 < argc) {
@@ -547,9 +574,11 @@ int main(int argc, char **argv) {
         free(app);
         return 1;
     }
-    printf("rgrad_updates_enabled=%d (must be 0) loaded_ckpt=%d\n",
-           nerva_work_rgrad_updates_enabled(), app->loaded_ckpt);
-    printf("commands: /seq /teach /gen /hist /clear /quit  |  free text\n");
+    if (sample_flag)
+        app->sample_on = 1;
+    printf("rgrad_updates_enabled=%d (must be 0) loaded_ckpt=%d sample=%d\n",
+           nerva_work_rgrad_updates_enabled(), app->loaded_ckpt, app->sample_on);
+    printf("commands: /seq /teach /gen /sample /hist /clear /quit  |  free text\n");
 
     if (selfcheck) {
         rc = run_selfcheck(app, stdout);
