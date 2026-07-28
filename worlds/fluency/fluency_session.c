@@ -726,8 +726,9 @@ static int header_valid(const NervaSessionHeader *h, uint64_t file_size) {
     return 1;
 }
 
-int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint8_t *chat_out,
-                         size_t chat_cap, size_t *chat_len_out) {
+int fluency_session_load_ex(NervaEngine *e, FluencyModel *m, const char *path, uint8_t *chat_out,
+                            size_t chat_cap, size_t *chat_len_out, uint32_t headroom_nodes,
+                            uint32_t headroom_edges, uint32_t headroom_names) {
     if (!e || !m || !path) {
         return -1;
     }
@@ -802,9 +803,9 @@ int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint
     int eng_owned = 0;
     if (e->nodes == NULL) {
         NervaConfig cfg = nerva_config_default();
-        cfg.max_nodes = h.max_nodes ? h.max_nodes : cfg.max_nodes;
-        cfg.max_edges = h.max_edges ? h.max_edges : cfg.max_edges;
-        cfg.max_names = h.max_names ? h.max_names : cfg.max_names;
+        cfg.max_nodes = (h.max_nodes ? h.max_nodes : cfg.max_nodes) + headroom_nodes;
+        cfg.max_edges = (h.max_edges ? h.max_edges : cfg.max_edges) + headroom_edges;
+        cfg.max_names = (h.max_names ? h.max_names : cfg.max_names) + headroom_names;
         cfg.max_memory_blocks = h.max_memory ? h.max_memory : cfg.max_memory_blocks;
         cfg.max_schemas = h.max_schemas ? h.max_schemas : cfg.max_schemas;
         cfg.weight_max_q8_8 = (nerva_q8_8_t)h.weight_max_q8_8;
@@ -897,6 +898,11 @@ int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint
 
     free(pay);
     return 0;
+}
+
+int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint8_t *chat_out,
+                         size_t chat_cap, size_t *chat_len_out) {
+    return fluency_session_load_ex(e, m, path, chat_out, chat_cap, chat_len_out, 0u, 0u, 0u);
 }
 
 int fluency_save(const FluencyModel *m, const char *path) {

@@ -34,15 +34,17 @@ LIB_SRCS = \
 LIB_OBJS = $(patsubst src/%.c,build/%.o,$(LIB_SRCS))
 FLU_OBJS = build/fluency.o build/fluency_session.o
 
-.PHONY: all product pretrain selfcheck clean checkpoints
+.PHONY: all product pretrain selfcheck clean
 
 all product: $(BIN) $(PRETRAIN)
 
+# Real directory targets (not .PHONY): the recipe only runs when the directory
+# is missing, and plain mkdir works under both sh and cmd shells.
 build:
-	mkdir -p build
+	mkdir build
 
 checkpoints:
-	mkdir -p checkpoints
+	mkdir checkpoints
 
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@

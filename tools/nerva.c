@@ -27,6 +27,12 @@
 #define DEFAULT_CKPT "checkpoints/tinystories.sess"
 #define DEFAULT_WORDS "checkpoints/tinystories.words"
 
+/* Full pretrain fills node/edge caps exactly; teach needs spare capacity to
+ * mint novel contexts. Chat boot only — pretrain resume keeps stored caps. */
+#define TEACH_HEADROOM_NODES 16384u
+#define TEACH_HEADROOM_EDGES 65536u
+#define TEACH_HEADROOM_NAMES 16384u
+
 typedef struct {
     NervaEngine eng;
     FluencyModel model;
@@ -58,8 +64,9 @@ static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
     memset(&a->eng, 0, sizeof(a->eng));
     memset(&a->model, 0, sizeof(a->model));
     fluency_words_init(&a->words);
-    if (fluency_load(&a->eng, &a->model, ckpt) != 0) {
-        fprintf(stderr, "boot: fluency_load failed path=%s\n", ckpt);
+    if (fluency_session_load_ex(&a->eng, &a->model, ckpt, NULL, 0, NULL, TEACH_HEADROOM_NODES,
+                                TEACH_HEADROOM_EDGES, TEACH_HEADROOM_NAMES) != 0) {
+        fprintf(stderr, "boot: fluency_session_load_ex failed path=%s\n", ckpt);
         return -1;
     }
     if (nerva_words_load(&a->words, words_path) != 0) {
@@ -80,8 +87,8 @@ static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
     a->train_n = 0;
     printf("boot_mode=LOAD_CHECKPOINT (no pretrain this launch)\n");
     printf("ckpt=%s ckpt_bytes=%ld words=%s vocab=%u\n", ckpt, sz, words_path, a->words.count);
-    printf("boot: order=%u nodes=%u edges=%u\n", a->model.order, a->eng.node_count,
-           a->eng.edge_count);
+    printf("boot: order=%u nodes=%u/%u edges=%u/%u (teach headroom loaded)\n", a->model.order,
+           a->eng.node_count, a->eng.node_cap, a->eng.edge_count, a->eng.edge_cap);
     printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
     return 0;
 }

@@ -81,5 +81,12 @@ int fluency_session_save(const FluencyModel *m, const char *path, const uint8_t 
 /* e/m zeroed on entry. chat_out may be NULL if chat_cap==0 (chat section ignored). */
 int fluency_session_load(NervaEngine *e, FluencyModel *m, const char *path, uint8_t *chat_out,
                          size_t chat_cap, size_t *chat_len_out);
+/* Same, but when this call initializes the engine it adds headroom above the
+ * stored caps. A full pretrain saturates node/edge caps exactly; without spare
+ * capacity fluency_pcw_teach_sequence cannot mint novel contexts (returns -1).
+ * Headroom is opt-in so pretrain resume keeps the registered caps unchanged. */
+int fluency_session_load_ex(NervaEngine *e, FluencyModel *m, const char *path, uint8_t *chat_out,
+                            size_t chat_cap, size_t *chat_len_out, uint32_t headroom_nodes,
+                            uint32_t headroom_edges, uint32_t headroom_names);
 
 #endif
