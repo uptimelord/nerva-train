@@ -41,9 +41,14 @@ typedef struct {
     size_t train_n;
     flu_tok_t hist[HIST_MAX];
     size_t hist_n;
+    /* Last predict context for /why (order-truncated). */
+    flu_tok_t last_ctx[FLUENCY_MAX_ORDER];
+    size_t last_ctx_len;
+    int last_pred_valid;
     size_t gen_default;
     int ready;
     int loaded_ckpt; /* 1 = frozen checkpoint (no pretrain this boot) */
+    int organs_present; /* tables in side blob */
     int sample_on;   /* 0 = greedy (default); 1 = sample from fluency_generate dist */
     uint32_t rng_counter; /* incremented per sampled generate for varied seeds */
 } App;
@@ -54,10 +59,79 @@ static void usage(const char *prog) {
     printf("  nerva-train: one graph, one generate path (fluency + PCW).\n");
     printf("  Default boot: load frozen TinyStories checkpoint if present (no retrain).\n");
     printf("  Pretrain once: make pretrain  →  checkpoints/tinystories.sess\n");
-    printf("  /seq /teach /gen /sample /hist /clear /quit | free text\n");
+    printf("  Organs once:   ./build/pretrain --organs\n");
+    printf("  /seq /teach /gen /sample /hist /clear /why /mood /hubs /organs /quit | free text\n");
     printf("  --selfcheck   PASS/FAIL (uses ckpt if present, else smoke train)\n");
     printf("  --force-smoke-train  ignore ckpt; tiny train.txt boot only\n");
     printf("  --sample      enable multinomial sampling (default: greedy)\n");
+}
+
+static int organs_tables_present(const FluencyModel *m) {
+    int mood = (m->mood_aff != NULL && m->mood_k > 0u);
+    int gain = (m->gain_cooc && m->gain_tok && m->gain_vidx && m->gain_topk > 0u);
+    int hubs = (m->tok_hubs && m->hub_mem_tok && m->hub_mem_w && m->hub_mem_n && m->hub_h > 0u);
+    return (mood && gain && hubs) ? 1 : 0;
+}
+
+static size_t organs_table_bytes(const FluencyModel *m) {
+    size_t b = 0;
+    if (m->mood_aff && m->mood_k > 0u)
+        b += sizeof(float) * (size_t)FLUENCY_VOCAB * (size_t)m->mood_k;
+    if (m->gain_cooc && m->gain_tok && m->gain_vidx && m->gain_topk > 0u) {
+        b += sizeof(uint32_t) * (size_t)m->gain_topk * (size_t)m->gain_topk;
+        b += sizeof(flu_tok_t) * (size_t)m->gain_topk;
+        b += sizeof(uint16_t) * (size_t)FLUENCY_VOCAB;
+    }
+    if (m->tok_hubs && m->hub_mem_tok && m->hub_mem_w && m->hub_mem_n && m->hub_h > 0u) {
+        b += sizeof(FluencyHubSlot) * (size_t)FLUENCY_VOCAB * (size_t)FLU_HUB_MEM_MAX;
+        b += sizeof(flu_tok_t) * (size_t)m->hub_h * (size_t)FLU_HUB_SIZE_CAP;
+        b += sizeof(nerva_uq0_16_t) * (size_t)m->hub_h * (size_t)FLU_HUB_SIZE_CAP;
+        b += sizeof(uint16_t) * (size_t)m->hub_h;
+    }
+    return b;
+}
+
+static void organs_enable_if_present(App *a) {
+    a->organs_present = organs_tables_present(&a->model);
+    if (!a->organs_present)
+        return;
+    fluency_mood_set(&a->model, 1);
+    fluency_gain_set(&a->model, 1);
+    fluency_hubs_set(&a->model, 1);
+    fluency_mood_reset(&a->model);
+    printf("organs=present mood_on=%u gain_on=%u hub_on=%u mood_k=%u gain_topk=%u "
+           "hub_h=%u table_bytes=%zu hub_conf_margin=%d\n",
+           (unsigned)a->model.mood_on, (unsigned)a->model.gain_on, (unsigned)a->model.hub_on,
+           (unsigned)a->model.mood_k, (unsigned)a->model.gain_topk, (unsigned)a->model.hub_h,
+           organs_table_bytes(&a->model), (int)a->model.hub_conf_margin);
+}
+
+static const char *app_word_fn(void *ud, flu_tok_t id) {
+    return fluency_words_word((const FluencyWords *)ud, id);
+}
+
+/* User tokens: full mood weight. Self tokens: 1/FLU_MOOD_SELF_DIV. */
+static void mood_observe_toks(App *a, const flu_tok_t *toks, size_t n, float weight) {
+    size_t i;
+    if (!a || !toks || n == 0)
+        return;
+    for (i = 0; i < n; ++i)
+        fluency_mood_observe(&a->model, toks[i], weight);
+}
+
+static void snapshot_last_ctx(App *a, const flu_tok_t *seed, size_t seed_n) {
+    size_t take;
+    if (!a || !seed || seed_n < 1) {
+        a->last_ctx_len = 0;
+        a->last_pred_valid = 0;
+        return;
+    }
+    take = seed_n < a->model.order ? seed_n : (size_t)a->model.order;
+    if (take > FLUENCY_MAX_ORDER)
+        take = FLUENCY_MAX_ORDER;
+    memcpy(a->last_ctx, seed + (seed_n - take), take * sizeof(flu_tok_t));
+    a->last_ctx_len = take;
+    a->last_pred_valid = 1;
 }
 
 /* Load frozen weights + word lexicon. Engine must be zeroed (not inited). */
@@ -99,6 +173,7 @@ static int app_boot_ckpt(App *a, const char *ckpt, const char *words_path) {
     printf("fast_lambda=%u fast_w0=%d (lab chat; ckpt λ/w0 were no-op)\n",
            (unsigned)a->model.fast_lambda, (int)a->model.fast_w0);
     printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
+    organs_enable_if_present(a);
     return 0;
 }
 
@@ -171,10 +246,12 @@ static int app_boot_smoke(App *a) {
     nerva_work_set_rgrad_updates(0);
     a->ready = 1;
     a->loaded_ckpt = 0;
+    a->organs_present = 0;
     printf("boot_mode=SMOKE_TRAIN (not full TinyStories — run make pretrain for ckpt)\n");
     printf("boot: words=%u train_toks=%zu order=%u nodes=%u edges=%u\n", a->words.count, a->train_n,
            a->model.order, a->eng.node_count, a->eng.edge_count);
     printf("graph=fluency  generate=fluency_generate  credit=fluency_pcw_teach_sequence\n");
+    /* Organs absent on smoke path — stay off silently. */
     return 0;
 }
 
@@ -242,6 +319,7 @@ static int do_seq(App *a, const char *line, FILE *out) {
     fprintf(out, "taught (fluency_pcw_teach_sequence) n=%zu rc=%d: ", n, rc);
     print_tokens(a, ids, n, out);
     fprintf(out, "\n");
+    mood_observe_toks(a, ids, n, 1.0f);
     /* Condition hist with taught sequence so free-chat can continue. */
     hist_push(a, ids, n);
     return rc < 0 ? -1 : 0;
@@ -260,6 +338,7 @@ static int generate_from(App *a, const flu_tok_t *seed, size_t seed_n, size_t n_
         a->rng_counter++;
         rng_seed = a->rng_counter ? a->rng_counter : 1u;
     }
+    snapshot_last_ctx(a, seed, seed_n);
     a0 = nerva_work_pcw_apply_count();
     fluency_generate(&a->model, seed, seed_n, gen, n_gen, rng_seed, sample);
     a1 = nerva_work_pcw_apply_count();
@@ -273,7 +352,6 @@ static int do_gen(App *a, const char *seed_word, size_t n_gen, FILE *out) {
     flu_tok_t gen[GEN_MAX + 1];
     uint32_t sid;
     uint64_t d = 0;
-    size_t i;
 
     if (!seed_word || !seed_word[0] || n_gen < 1 || n_gen > GEN_MAX) {
         fprintf(out, "usage: /gen <seed_word> [n]\n");
@@ -292,9 +370,10 @@ static int do_gen(App *a, const char *seed_word, size_t n_gen, FILE *out) {
     fprintf(out, "\n");
     fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d sample=%d]\n",
             n_gen, (unsigned long long)d, !nerva_work_rgrad_updates_enabled(), a->sample_on);
+    mood_observe_toks(a, seed, 1, 1.0f);
+    mood_observe_toks(a, gen, n_gen, 1.0f / (float)FLU_MOOD_SELF_DIV);
     hist_push(a, seed, 1);
     hist_push(a, gen, n_gen);
-    (void)i;
     return 0;
 }
 
@@ -310,6 +389,7 @@ static int do_freechat(App *a, const char *line, FILE *out) {
         fprintf(out, "nerva> (no tokens)\n");
         return 0;
     }
+    mood_observe_toks(a, ids, n, 1.0f);
     hist_push(a, ids, n);
     take = a->hist_n < a->model.order ? a->hist_n : (size_t)a->model.order;
     if (take < 1)
@@ -328,6 +408,7 @@ static int do_freechat(App *a, const char *line, FILE *out) {
     fprintf(out, "\n");
     fprintf(out, "  [reply_source=fluency_generate n=%zu apply_delta=%llu rgrad_off=%d sample=%d]\n",
             n_gen, (unsigned long long)d, !nerva_work_rgrad_updates_enabled(), a->sample_on);
+    mood_observe_toks(a, gen, n_gen, 1.0f / (float)FLU_MOOD_SELF_DIV);
     hist_push(a, gen, n_gen);
     return 0;
 }
@@ -342,6 +423,11 @@ static int match_prefix(const flu_tok_t *gen, size_t n_gen, const flu_tok_t *wan
     return 1;
 }
 
+/*
+ * Selfcheck runs with organs in their booted state (on when tables present).
+ * Mood register is reset before the teach/generate probe so conversation drift
+ * cannot poison seq_match; bars themselves are unchanged.
+ */
 static int run_selfcheck(App *a, FILE *out) {
     const char *phrase = "alice likes green tea";
     flu_tok_t ids[MAX_TOK];
@@ -353,10 +439,17 @@ static int run_selfcheck(App *a, FILE *out) {
 
     /* Selfcheck requires deterministic greedy generation regardless of --sample. */
     a->sample_on = 0;
+    a->hist_n = 0;
+    a->last_pred_valid = 0;
+    fluency_mood_reset(&a->model);
 
     fprintf(out, "nerva-train selfcheck — single stack\n");
     fprintf(out, "AUDIT reply_source=fluency_generate (not template)\n");
     fprintf(out, "AUDIT learn=fluency_pcw_teach_sequence; rgrad OFF\n");
+    fprintf(out, "AUDIT organs_booted mood_on=%u gain_on=%u hub_on=%u present=%d "
+                 "(selfcheck keeps booted state; mood reset before probe)\n",
+            (unsigned)a->model.mood_on, (unsigned)a->model.gain_on, (unsigned)a->model.hub_on,
+            a->organs_present);
 
     nerva_work_set_rgrad_updates(0);
     if (a->eng.edge_count > 0) {
@@ -464,12 +557,77 @@ static int handle_line(App *a, char *line, FILE *out) {
     }
     if (strcmp(line, "/clear") == 0) {
         a->hist_n = 0;
-        fprintf(out, "hist cleared\n");
+        a->last_pred_valid = 0;
+        fluency_mood_reset(&a->model);
+        fprintf(out, "hist cleared; mood reset\n");
         return 1;
     }
     if (strcmp(line, "/sample") == 0) {
         a->sample_on = a->sample_on ? 0 : 1;
         fprintf(out, "sample=%s\n", a->sample_on ? "on" : "off");
+        return 1;
+    }
+    if (strcmp(line, "/why") == 0) {
+        FluencyWhy w;
+        if (!a->last_pred_valid || a->last_ctx_len == 0u) {
+            fprintf(out, "why: (no prediction to explain — generate first)\n");
+            return 1;
+        }
+        if (fluency_explain(&a->model, a->last_ctx, a->last_ctx_len, &w) != 0) {
+            fprintf(out, "why: explain failed\n");
+            return 1;
+        }
+        fluency_why_print(&w, out, app_word_fn, &a->words);
+        return 1;
+    }
+    if (strcmp(line, "/mood") == 0) {
+        fluency_mood_print(&a->model, out, app_word_fn, &a->words);
+        return 1;
+    }
+    if (strncmp(line, "/hubs ", 6) == 0) {
+        uint32_t sid = fluency_words_id(&a->words, line + 6, 0);
+        if (sid >= FLUENCY_VOCAB) {
+            fprintf(out, "hubs: unknown word\n");
+            return 1;
+        }
+        fluency_hubs_print(&a->model, (flu_tok_t)sid, out, app_word_fn, &a->words);
+        return 1;
+    }
+    if (strcmp(line, "/hubs") == 0) {
+        fprintf(out, "usage: /hubs <word>\n");
+        return 1;
+    }
+    if (strncmp(line, "/organs", 7) == 0) {
+        const char *arg = line + 7;
+        while (*arg == ' ' || *arg == '\t')
+            arg++;
+        if (*arg == '\0') {
+            fprintf(out,
+                    "organs present=%d mood_on=%u gain_on=%u hub_on=%u mood_k=%u "
+                    "gain_topk=%u hub_h=%u table_bytes=%zu\n",
+                    a->organs_present, (unsigned)a->model.mood_on, (unsigned)a->model.gain_on,
+                    (unsigned)a->model.hub_on, (unsigned)a->model.mood_k,
+                    (unsigned)a->model.gain_topk, (unsigned)a->model.hub_h,
+                    organs_table_bytes(&a->model));
+            return 1;
+        }
+        if (!a->organs_present) {
+            fprintf(out, "organs: tables absent (build with pretrain --organs)\n");
+            return 1;
+        }
+        if (strcmp(arg, "on") == 0) {
+            fluency_mood_set(&a->model, 1);
+            fluency_gain_set(&a->model, 1);
+            fluency_hubs_set(&a->model, 1);
+            fprintf(out, "organs=on\n");
+        } else if (strcmp(arg, "off") == 0) {
+            fluency_mood_set(&a->model, 0);
+            fluency_gain_set(&a->model, 0);
+            fluency_hubs_set(&a->model, 0);
+            fprintf(out, "organs=off\n");
+        } else {
+            fprintf(out, "usage: /organs [on|off]\n");
+        }
         return 1;
     }
     if (strncmp(line, "/seq ", 5) == 0) {
@@ -578,7 +736,8 @@ int main(int argc, char **argv) {
         app->sample_on = 1;
     printf("rgrad_updates_enabled=%d (must be 0) loaded_ckpt=%d sample=%d\n",
            nerva_work_rgrad_updates_enabled(), app->loaded_ckpt, app->sample_on);
-    printf("commands: /seq /teach /gen /sample /hist /clear /quit  |  free text\n");
+    printf("commands: /seq /teach /gen /sample /hist /clear /why /mood /hubs /organs /quit  |  "
+           "free text\n");
 
     if (selfcheck) {
         rc = run_selfcheck(app, stdout);

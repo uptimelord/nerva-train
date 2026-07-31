@@ -69,4 +69,8 @@ selfcheck: $(BIN)
 	./$(BIN) --selfcheck
 
 clean:
+ifeq ($(OS),Windows_NT)
+	-if exist build rmdir /s /q build
+else
 	rm -rf build
+endif

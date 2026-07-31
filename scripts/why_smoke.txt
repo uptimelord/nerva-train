@@ -1,0 +1,6 @@
+/teach the brave knight fought the dragon
+/gen knight 4
+/why
+/mood
+/hubs dragon
+/quit

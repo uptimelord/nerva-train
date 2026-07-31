@@ -1,0 +1,10 @@
+/organs off
+/gen once 12
+/gen dragon 12
+/gen princess 12
+/organs on
+/clear
+/gen once 12
+/gen dragon 12
+/gen princess 12
+/quit
